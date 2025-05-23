@@ -1,0 +1,69 @@
+name: mainline-kernel
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+jobs:
+  build-kernel:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: riscv64
+
+    runs-on: ubuntu-22.04
+    env:
+      mainline_toolchain: https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2024.04.12
+      mainline_toolchain_file_name: riscv64-glibc-ubuntu-22.04-gcc-nightly-2024.04.12-nightly.tar.gz
+      wget_alias: 'wget --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 -t 0'
+      ARCH: riscv
+      KBUILD_BUILD_USER: riscv
+      KBUILD_BUILD_HOST: riscv-builder
+      KDEB_COMPRESS: xz
+      CROSS_COMPILE: riscv64-unknown-linux-gnu-
+
+    steps:
+      - name: Update Apt Cache
+        run: sudo apt update
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: build-dir
+
+      - name: Install software
+        run: |
+              sudo apt install -y build-essential libncurses-dev gawk flex bison \
+                                  device-tree-compiler xz-utils ccache bc
+
+      - name: Compile Kernel && Install
+        run: |
+              mkdir -p artifact
+              ${wget_alias} ${mainline_toolchain}/${mainline_toolchain_file_name}
+              tar -xvf ${mainline_toolchain_file_name} -C /opt
+              export PATH="/opt/riscv/bin:$PATH"
+
+              ${CROSS_COMPILE}gcc -v
+              pushd build-dir
+                export KDEB_PKGVERSION="$(make kernelversion)-$(date "+%Y.%m.%d.%H.%M")+$(git rev-parse --short HEAD)"
+                make defconfig
+                make dtbs
+                make
+                sudo cp -v arch/riscv/boot/dts/*/*.dtb ../artifact
+                sudo cp -v arch/riscv/boot/Image ../artifact
+                sudo cp -v arch/riscv/boot/vmlinux ../artifact
+              popd
+
+      - name: Compress
+        run: tar -zcvf linux-mainline-${{ matrix.name }}.tar.gz artifact
+
+      - name: 'Upload Artifact'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-mainline-${{ matrix.name }}.tar.gz
+          path: linux-mainline-${{ matrix.name }}.tar.gz
+          retention-days: 30
