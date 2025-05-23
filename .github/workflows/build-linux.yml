@@ -1,0 +1,138 @@
+name: Build Linux Kernel
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+jobs:
+  build-kernel:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: riscv64
+
+    runs-on: ubuntu-22.04
+    env:
+      TOOLCHAIN_URL: https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2024.04.12
+      TOOLCHAIN_FILE: riscv64-glibc-ubuntu-22.04-gcc-nightly-2024.04.12-nightly.tar.gz
+      ROOTFS_URL: https://gitlab.com/buildroot.org/buildroot/-/jobs/10110577943/artifacts/raw/output/images/rootfs.ext2
+      ARCH: riscv
+      KBUILD_BUILD_USER: riscv
+      KBUILD_BUILD_HOST: riscv-builder
+      KDEB_COMPRESS: xz
+      CROSS_COMPILE: riscv64-unknown-linux-gnu-
+      UBOOT_VERSION: v2025.07-rc2
+      OPNESBI_VERSION: v1.6
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          path: build-dir
+
+      - name: Install Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential libncurses-dev gawk flex bison \
+                              device-tree-compiler xz-utils ccache bc \
+                              qemu-system-misc expect
+
+      - name: Setup RISC-V Toolchain
+        run: |
+          wget --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 -t 0 \
+               ${TOOLCHAIN_URL}/${TOOLCHAIN_FILE}
+          sudo tar -xf ${TOOLCHAIN_FILE} -C /opt
+          export PATH="/opt/riscv/bin:$PATH"
+          ${CROSS_COMPILE}gcc -v
+
+      - name: Configure Kernel
+        working-directory: build-dir
+        run: |
+          export PATH="/opt/riscv/bin:$PATH"
+          make defconfig
+
+      - name: Build Device Tree Blobs
+        working-directory: build-dir
+        run: |
+          export PATH="/opt/riscv/bin:$PATH"
+          make dtbs
+
+      - name: Build Kernel
+        working-directory: build-dir
+        run: |
+          export PATH="/opt/riscv/bin:$PATH"
+          make -j$(( $(nproc) - 2 ))
+          #wget --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 -t 0 \
+          #     https://gitlab.com/buildroot.org/buildroot/-/jobs/10110577943/artifacts/raw/output/images/Image
+          #mv Image arch/riscv/boot
+
+      - name: Clone OpenSBI
+        run: |
+          mkdir -p opensbi-build
+          git clone https://github.com/riscv/opensbi.git opensbi-build/opensbi
+
+      - name: Build OpenSBI
+        run: |
+          export PATH="/opt/riscv/bin:$PATH"
+          cd opensbi-build/opensbi
+          git checkout ${OPENSBI_VERSION}
+          make PLATFORM=generic -j$(nproc)
+
+      - name: Download Buildroot rootfs
+        run: |
+          wget --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 -t 0 \
+               ${ROOTFS_URL}
+
+      - name: Run QEMU
+        run: |
+          cat > test_linux.exp << 'EOF'
+          #!/usr/bin/expect -f
+          set timeout 60
+          spawn qemu-system-riscv64 -machine virt \
+                                    -nographic -m 2048 \
+                                    -smp 2 \
+                                    -bios opensbi-build/opensbi/build/platform/generic/firmware/fw_jump.bin \
+                                    -kernel build-dir/arch/riscv/boot/Image \
+                                    -append "rootwait root=/dev/vda ro console=ttyS0" \
+                                    -drive file=rootfs.ext2,format=raw,id=hd0,if=none \
+                                    -device virtio-blk-device,drive=hd0 \
+                                    -device virtio-net-device,netdev=eth0 -netdev user,id=eth0 \
+                                    -device virtio-rng-pci
+          expect {
+            "login:" {
+              puts "\nSystem booted successfully!"
+              exit 0
+            }
+            "Waiting for root device" {
+              puts "\nFailed to find root device"
+              exit 1
+            }
+            timeout {
+              puts "\nTimeout waiting for system boot"
+              exit 1
+            }
+          }
+          EOF
+          chmod +x test_linux.exp
+          ./test_linux.exp
+
+      - name: Prepare Artifacts
+        run: |
+          mkdir -p artifact
+          cp -v build-dir/arch/riscv/boot/dts/*/*.dtb artifact/
+          cp -v build-dir/arch/riscv/boot/Image artifact/
+
+      - name: Create Archive
+        run: |
+          tar -zcvf linux-mainline-${{ matrix.name }}.tar.gz artifact
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-mainline-${{ matrix.name }}.tar.gz
+          path: linux-mainline-${{ matrix.name }}.tar.gz
+          retention-days: 30
